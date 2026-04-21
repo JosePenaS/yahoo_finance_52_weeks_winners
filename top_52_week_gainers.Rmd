@@ -1,0 +1,1419 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(rvest)
+library(xml2)
+library(jsonlite)
+library(purrr)
+```
+
+```{r}
+
+library(rvest)
+library(xml2)
+library(dplyr)
+library(purrr)
+
+base_url <- "https://finance.yahoo.com/markets/stocks/52-week-gainers/"
+dest_folder <- "C:/Users/lenovo/Desktop/r_pkgs/yahoo_pages"
+
+dir.create(dest_folder, showWarnings = FALSE, recursive = TRUE)
+
+total_rows <- 150
+page_size <- 25
+starts <- seq(0, total_rows - page_size, by = page_size)
+
+scrape_yahoo_page <- function(start_value, page_size = 25, dest_folder) {
+  url <- paste0(base_url, "?start=", start_value, "&count=", page_size)
+  
+  html_file <- file.path(
+    dest_folder,
+    paste0("yahoo_52_week_gainers_", start_value, ".html")
+  )
+  
+  status <- system2(
+    "curl.exe",
+    args = c(
+      "-L",
+      "-A", "Mozilla/5.0",
+      "-o", shQuote(html_file),
+      url
+    )
+  )
+  
+  if (status != 0 || !file.exists(html_file)) {
+    message("Falló descarga para start=", start_value)
+    return(NULL)
+  }
+  
+  page <- read_html(html_file)
+  
+  tables <- page %>%
+    html_elements("table") %>%
+    html_table(fill = TRUE)
+  
+  if (length(tables) == 0) {
+    message("No se encontraron tablas para start=", start_value)
+    return(NULL)
+  }
+  
+  out <- tables[[1]]
+  
+  # arreglar nombre vacío
+  names(out)[names(out) == ""] <- "Chart"
+  
+  out %>%
+    mutate(
+      start = start_value,
+      source_url = url
+    )
+}
+
+all_data <- map_dfr(
+  starts,
+  scrape_yahoo_page,
+  page_size = page_size,
+  dest_folder = dest_folder
+)
+
+all_data
+```
+
+```{r}
+
+parse_yahoo_num <- function(x) {
+  x <- str_trim(x)
+  
+  multiplier <- case_when(
+    str_detect(x, "[Kk]$") ~ 1e3,
+    str_detect(x, "[Mm]$") ~ 1e6,
+    str_detect(x, "[Bb]$") ~ 1e9,
+    str_detect(x, "[Tt]$") ~ 1e12,
+    TRUE ~ 1
+  )
+  
+  number_part <- x %>%
+    str_remove("[KkMmBbTt]$") %>%
+    parse_number()
+  
+  number_part * multiplier
+}
+
+```
+
+```{r}
+all_data_clean<-all_data %>%
+  mutate(
+    Price_raw = Price,
+    Price = str_extract(Price_raw, "^[0-9,.]+"),
+    Price = parse_number(Price),
+    `Change %` = parse_number(`Change %`),
+    Volume = parse_yahoo_num(Volume),
+    `Avg Vol (3M)` = parse_yahoo_num(`Avg Vol (3M)`),
+    `Market Cap` = parse_yahoo_num(`Market Cap`),
+    `52 Wk Change %` = parse_number(`52 Wk Change %`)
+  )%>%
+  mutate(
+    `P/E Ratio (TTM)` = na_if(`P/E Ratio (TTM)`, "--"),
+    `P/E Ratio (TTM)` = parse_number(`P/E Ratio (TTM)`),
+    `52 Wk Range` = str_squish(`52 Wk Range`)
+  ) %>%
+  separate(
+    `52 Wk Range`,
+    into = c("wk52_low", "wk52_high"),
+    sep = "\\s+",
+    convert = TRUE
+  ) %>% 
+  select(-Chart) %>% 
+  mutate(date=today())
+```
+
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+
+yahoo_52wk_db <- all_data_clean %>%
+  transmute(
+    Symbol            = as.character(Symbol),
+    Name              = as.character(Name),
+    Price             = as.numeric(Price),
+    Change            = as.numeric(Change),
+    `Change %`        = as.numeric(`Change %`),
+    Volume            = as.numeric(Volume),
+    `Avg Vol (3M)`    = as.numeric(`Avg Vol (3M)`),
+    `Market Cap`      = as.numeric(`Market Cap`),
+    `P/E Ratio (TTM)` = as.numeric(`P/E Ratio (TTM)`),
+    `52 Wk Change %`  = as.numeric(`52 Wk Change %`),
+    wk52_low          = as.numeric(wk52_low),
+    wk52_high         = as.character(wk52_high),
+    start             = as.numeric(start),
+    source_url        = as.character(source_url),
+    Price_raw         = as.character(Price_raw),
+    date              = as.Date(date)
+  ) %>%
+  distinct(Symbol, date, .keep_all = TRUE)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+dbGetQuery(con, "select '✅ connected' as status, now();")
+
+dbExecute(con, '
+  CREATE TABLE IF NOT EXISTS public.yahoo_52_week_gainers (
+    "Symbol" text,
+    "Name" text,
+    "Price" double precision,
+    "Change" double precision,
+    "Change %" double precision,
+    "Volume" double precision,
+    "Avg Vol (3M)" double precision,
+    "Market Cap" double precision,
+    "P/E Ratio (TTM)" double precision,
+    "52 Wk Change %" double precision,
+    "wk52_low" double precision,
+    "wk52_high" text,
+    "start" double precision,
+    "source_url" text,
+    "Price_raw" text,
+    "date" date,
+    PRIMARY KEY ("Symbol", "date")
+  );
+')
+
+dbWriteTable(
+  con,
+  "tmp_yahoo_52_week_gainers",
+  yahoo_52wk_db,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+dbExecute(con, '
+  INSERT INTO public.yahoo_52_week_gainers AS t
+    ("Symbol", "Name", "Price", "Change", "Change %", "Volume",
+     "Avg Vol (3M)", "Market Cap", "P/E Ratio (TTM)", "52 Wk Change %",
+     "wk52_low", "wk52_high", "start", "source_url", "Price_raw", "date")
+  SELECT
+    "Symbol",
+    "Name",
+    "Price",
+    "Change",
+    "Change %",
+    "Volume",
+    "Avg Vol (3M)",
+    "Market Cap",
+    "P/E Ratio (TTM)",
+    "52 Wk Change %",
+    "wk52_low",
+    "wk52_high",
+    "start",
+    "source_url",
+    "Price_raw",
+    "date"
+  FROM tmp_yahoo_52_week_gainers
+  ON CONFLICT ("Symbol", "date") DO UPDATE
+  SET
+    "Name"            = EXCLUDED."Name",
+    "Price"           = EXCLUDED."Price",
+    "Change"          = EXCLUDED."Change",
+    "Change %"        = EXCLUDED."Change %",
+    "Volume"          = EXCLUDED."Volume",
+    "Avg Vol (3M)"    = EXCLUDED."Avg Vol (3M)",
+    "Market Cap"      = EXCLUDED."Market Cap",
+    "P/E Ratio (TTM)" = EXCLUDED."P/E Ratio (TTM)",
+    "52 Wk Change %"  = EXCLUDED."52 Wk Change %",
+    "wk52_low"        = EXCLUDED."wk52_low",
+    "wk52_high"       = EXCLUDED."wk52_high",
+    "start"           = EXCLUDED."start",
+    "source_url"      = EXCLUDED."source_url",
+    "Price_raw"       = EXCLUDED."Price_raw";
+')
+
+dbDisconnect(con)
+
+```
+
+
+
+```{r}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",   # ← include project ref!
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+data <- DBI::dbReadTable(con, "yahoo_52_week_gainers")
+```
+
+
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(zoo)
+
+download_yahoo_chart <- function(symbol, from, to, dest_folder = tempdir()) {
+  period1 <- as.integer(as.POSIXct(from, tz = "UTC"))
+  period2 <- as.integer(as.POSIXct(to,   tz = "UTC"))
+  
+  url <- paste0(
+    "https://query1.finance.yahoo.com/v8/finance/chart/",
+    symbol,
+    "?period1=", period1,
+    "&period2=", period2,
+    "&interval=1d&includePrePost=false&events=div%2Csplits"
+  )
+  
+  json_file <- file.path(dest_folder, paste0(symbol, "_chart.json"))
+  curl_bin  <- if (.Platform$OS.type == "windows") "curl.exe" else "curl"
+  
+  status <- tryCatch(
+    system2(
+      curl_bin,
+      args = c(
+        "-L",
+        "-A", "Mozilla/5.0",
+        "-o", shQuote(json_file),
+        url
+      )
+    ),
+    error = function(e) 1
+  )
+  
+  if (!file.exists(json_file) || status != 0) {
+    message("Failed download: ", symbol)
+    return(NULL)
+  }
+  
+  txt <- paste(readLines(json_file, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+  obj <- tryCatch(fromJSON(txt, simplifyDataFrame = FALSE), error = function(e) NULL)
+  if (is.null(obj)) return(NULL)
+  
+  result <- obj$chart$result[[1]]
+  if (is.null(result) || is.null(result$timestamp)) return(NULL)
+  
+  q <- result$indicators$quote[[1]]
+  if (is.null(q)) return(NULL)
+  
+  tibble(
+    symbol = symbol,
+    date   = as.Date(as.POSIXct(result$timestamp, origin = "1970-01-01", tz = "UTC")),
+    open   = as.numeric(q$open),
+    high   = as.numeric(q$high),
+    low    = as.numeric(q$low),
+    close  = as.numeric(q$close),
+    volume = as.numeric(q$volume)
+  ) %>%
+    filter(!is.na(date), !is.na(close))
+}
+
+flag_bad_history <- function(prices_tbl, min_nonzero_days = 20, min_total_days = 20) {
+  prices_tbl %>%
+    mutate(
+      flat_bar = !is.na(open) & !is.na(high) & !is.na(low) & !is.na(close) &
+        open == high & high == low & low == close,
+      zero_vol = is.na(volume) | volume == 0
+    ) %>%
+    group_by(symbol) %>%
+    summarise(
+      n_days = n(),
+      nonzero_vol_days = sum(!zero_vol, na.rm = TRUE),
+      all_flat_zero = all(flat_bar & zero_vol),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      bad_history = all_flat_zero |
+        nonzero_vol_days < min_nonzero_days |
+        n_days < min_total_days
+    )
+}
+
+add_ma_columns_to_dataset <- function(df, lookback_days = 80) {
+  df <- df %>%
+    mutate(
+      Symbol = as.character(Symbol),
+      date = as.Date(date)
+    )
+  
+  tickers <- unique(df$Symbol)
+  min_dt  <- min(df$date, na.rm = TRUE) - lookback_days
+  max_dt  <- max(df$date, na.rm = TRUE) + 1
+  
+  prices_list <- purrr::map(tickers, ~ download_yahoo_chart(.x, from = min_dt, to = max_dt))
+  names(prices_list) <- tickers
+  
+  failed <- names(prices_list)[purrr::map_lgl(prices_list, is.null)]
+  if (length(failed) > 0) {
+    message("Failed tickers: ", paste(failed, collapse = ", "))
+  }
+  
+  valid_prices <- prices_list[!purrr::map_lgl(prices_list, is.null)]
+  if (length(valid_prices) == 0) {
+    stop("No se pudo descargar ningún ticker.")
+  }
+  
+  prices <- bind_rows(valid_prices)
+  
+  quality_tbl <- flag_bad_history(prices)
+  
+  bad_symbols <- quality_tbl %>%
+    filter(bad_history) %>%
+    pull(symbol)
+  
+  if (length(bad_symbols) > 0) {
+    message("Excluded bad symbols: ", paste(bad_symbols, collapse = ", "))
+  }
+  
+  prices <- prices %>%
+    filter(!symbol %in% bad_symbols)
+  
+  ma_tbl <- prices %>%
+    group_by(symbol) %>%
+    arrange(date, .by_group = TRUE) %>%
+    mutate(
+      ma10 = zoo::rollmean(close, 10, fill = NA, align = "right"),
+      ma20 = zoo::rollmean(close, 20, fill = NA, align = "right")
+    ) %>%
+    ungroup() %>%
+    transmute(
+      Symbol = symbol,
+      date,
+      close_px = close,
+      ma10,
+      ma20,
+      close_above_ma10 = close > ma10,
+      close_above_ma20 = close > ma20,
+      ma10_above_ma20 = ma10 > ma20,
+      ma_setup_ok = close > ma10 & close > ma20 & ma10 > ma20
+    )
+  
+  df %>%
+    left_join(ma_tbl, by = c("Symbol", "date"))
+}
+```
+
+
+```{r}
+data_enriched <- add_ma_columns_to_dataset(all_data_clean)
+
+glimpse(data_enriched)
+```
+
+```{r}
+#ddd %>% glimpse()
+```
+
+
+```{r}
+#ddd %>% select(-X) %>% rbind(data_enriched)
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+
+standardize_yahoo <- function(df) {
+  df %>%
+    as_tibble() %>%
+    select(-any_of("X")) %>%
+    rename(
+      Symbol = any_of("Symbol"),
+      Name = any_of("Name"),
+      Price = any_of("Price"),
+      Change = any_of("Change"),
+      `Change %` = any_of("Change.."),
+      `Avg Vol (3M)` = any_of("Avg.Vol..3M."),
+      `Market Cap` = any_of("Market.Cap"),
+      `P/E Ratio (TTM)` = any_of("P.E.Ratio..TTM."),
+      `52 Wk Change %` = any_of("X52.Wk.Change..")
+    ) %>%
+    mutate(
+      date = as.Date(date),
+      Price = as.numeric(Price),
+      Change = as.numeric(Change),
+      `Change %` = as.numeric(`Change %`),
+      Volume = as.numeric(Volume),
+      `Avg Vol (3M)` = as.numeric(`Avg Vol (3M)`),
+      `Market Cap` = as.numeric(`Market Cap`),
+      `P/E Ratio (TTM)` = as.numeric(`P/E Ratio (TTM)`),
+      `52 Wk Change %` = as.numeric(`52 Wk Change %`),
+      wk52_low = as.numeric(wk52_low),
+      close_px = as.numeric(close_px),
+      ma10 = as.numeric(ma10),
+      ma20 = as.numeric(ma20),
+      close_above_ma10 = as.logical(close_above_ma10),
+      close_above_ma20 = as.logical(close_above_ma20),
+      ma10_above_ma20 = as.logical(ma10_above_ma20),
+      ma_setup_ok = as.logical(ma_setup_ok)
+    )
+}
+```
+
+```{r}
+#ddd2 <- standardize_yahoo(ddd)
+#data_enriched2 <- standardize_yahoo(data_enriched)
+
+#merged_data <- bind_rows(ddd2, data_enriched2) %>%
+ # distinct(Symbol, date, .keep_all = TRUE)
+
+#glimpse(merged_data)
+```
+
+```{r}
+#write.csv(merged_data,"merged_data22.csv")
+```
+
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+dbExecute(con, '
+  CREATE TABLE IF NOT EXISTS public.yahoo_52_week_gainers (
+    "Symbol" text,
+    "Name" text,
+    "Price" double precision,
+    "Change" double precision,
+    "Change %" double precision,
+    "Volume" double precision,
+    "Avg Vol (3M)" double precision,
+    "Market Cap" double precision,
+    "P/E Ratio (TTM)" double precision,
+    "52 Wk Change %" double precision,
+    "wk52_low" double precision,
+    "wk52_high" double precision,
+    "start" double precision,
+    "source_url" text,
+    "Price_raw" text,
+    "date" date,
+    "close_px" double precision,
+    "ma10" double precision,
+    "ma20" double precision,
+    "close_above_ma10" boolean,
+    "close_above_ma20" boolean,
+    "ma10_above_ma20" boolean,
+    "ma_setup_ok" boolean,
+    PRIMARY KEY ("Symbol", "date")
+  );
+')
+
+upload_df <- data_enriched %>%
+  transmute(
+    Symbol = as.character(Symbol),
+    Name = as.character(Name),
+    Price = as.numeric(Price),
+    Change = as.numeric(Change),
+    `Change %` = as.numeric(`Change %`),
+    Volume = as.numeric(Volume),
+    `Avg Vol (3M)` = as.numeric(`Avg Vol (3M)`),
+    `Market Cap` = as.numeric(`Market Cap`),
+    `P/E Ratio (TTM)` = as.numeric(`P/E Ratio (TTM)`),
+    `52 Wk Change %` = as.numeric(`52 Wk Change %`),
+    wk52_low = as.numeric(wk52_low),
+    wk52_high = as.numeric(wk52_high),
+    start = as.numeric(start),
+    source_url = as.character(source_url),
+    Price_raw = as.character(Price_raw),
+    date = as.Date(date),
+    close_px = as.numeric(close_px),
+    ma10 = as.numeric(ma10),
+    ma20 = as.numeric(ma20),
+    close_above_ma10 = as.logical(close_above_ma10),
+    close_above_ma20 = as.logical(close_above_ma20),
+    ma10_above_ma20 = as.logical(ma10_above_ma20),
+    ma_setup_ok = as.logical(ma_setup_ok)
+  ) %>%
+  distinct(Symbol, date, .keep_all = TRUE)
+
+dbWriteTable(
+  con,
+  "tmp_yahoo_52_week_gainers",
+  upload_df,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+dbExecute(con, '
+  INSERT INTO public.yahoo_52_week_gainers AS t
+    ("Symbol", "Name", "Price", "Change", "Change %", "Volume",
+     "Avg Vol (3M)", "Market Cap", "P/E Ratio (TTM)", "52 Wk Change %",
+     "wk52_low", "wk52_high", "start", "source_url", "Price_raw", "date",
+     "close_px", "ma10", "ma20", "close_above_ma10", "close_above_ma20",
+     "ma10_above_ma20", "ma_setup_ok")
+  SELECT
+    "Symbol", "Name", "Price", "Change", "Change %", "Volume",
+    "Avg Vol (3M)", "Market Cap", "P/E Ratio (TTM)", "52 Wk Change %",
+    "wk52_low", "wk52_high", "start", "source_url", "Price_raw", "date",
+    "close_px", "ma10", "ma20", "close_above_ma10", "close_above_ma20",
+    "ma10_above_ma20", "ma_setup_ok"
+  FROM tmp_yahoo_52_week_gainers
+  ON CONFLICT ("Symbol", "date") DO UPDATE
+  SET
+    "Name" = EXCLUDED."Name",
+    "Price" = EXCLUDED."Price",
+    "Change" = EXCLUDED."Change",
+    "Change %" = EXCLUDED."Change %",
+    "Volume" = EXCLUDED."Volume",
+    "Avg Vol (3M)" = EXCLUDED."Avg Vol (3M)",
+    "Market Cap" = EXCLUDED."Market Cap",
+    "P/E Ratio (TTM)" = EXCLUDED."P/E Ratio (TTM)",
+    "52 Wk Change %" = EXCLUDED."52 Wk Change %",
+    "wk52_low" = EXCLUDED."wk52_low",
+    "wk52_high" = EXCLUDED."wk52_high",
+    "start" = EXCLUDED."start",
+    "source_url" = EXCLUDED."source_url",
+    "Price_raw" = EXCLUDED."Price_raw",
+    "close_px" = EXCLUDED."close_px",
+    "ma10" = EXCLUDED."ma10",
+    "ma20" = EXCLUDED."ma20",
+    "close_above_ma10" = EXCLUDED."close_above_ma10",
+    "close_above_ma20" = EXCLUDED."close_above_ma20",
+    "ma10_above_ma20" = EXCLUDED."ma10_above_ma20",
+    "ma_setup_ok" = EXCLUDED."ma_setup_ok";
+')
+
+dbDisconnect(con)
+```
+
+####
+
+```{r}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+data2 <- DBI::dbReadTable(con, "yahoo_52_week_gainers") %>%
+  tibble::as_tibble()
+
+glimpse(data2)
+```
+
+```{r}
+data2 %>% count(date)
+```
+
+
+```{r}
+#write.csv(data2,"90.csv")
+```
+
+
+#####
+
+```{r}
+
+#stock_df<- data %>% filter(date=="2026-04-06") 
+```
+
+########
+#####
+
+
+```{r}
+library(DBI)
+library(RPostgres)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+dbExecute(con, '
+  CREATE TABLE IF NOT EXISTS public.yahoo_52wk_trades (
+    symbol text NOT NULL,
+    name text,
+    signal_date date NOT NULL,
+    entry_date date,
+    ma10 double precision,
+    ma20 double precision,
+    ma100 double precision,
+    open double precision,
+    high double precision,
+    low double precision,
+    close double precision,
+    entry_price double precision,
+    stop_price double precision,
+    stop_hit boolean,
+    exit_price double precision,
+    exit_reason text,
+    hold_days integer,
+    return_pct double precision,
+    PRIMARY KEY (symbol, signal_date)
+  );
+')
+
+dbDisconnect(con)
+
+```
+
+this one
+```{r}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(tibble)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+latest_date <- dbGetQuery(con, "
+  SELECT MAX(date) AS prev_date
+  FROM public.yahoo_52_week_gainers
+  WHERE date < (
+    SELECT MAX(date)
+    FROM public.yahoo_52_week_gainers
+  )
+")$prev_date %>% as.Date()
+
+stock_df <- dbGetQuery(
+  con,
+  paste0(
+    "SELECT * FROM public.yahoo_52_week_gainers WHERE date = '",
+    latest_date,
+    "'"
+  )
+) %>%
+  as_tibble()
+
+dbDisconnect(con)
+
+stock_df
+
+```
+
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(tibble)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+stock_df <- dbGetQuery(
+  con,
+  "SELECT * FROM public.yahoo_52_week_gainers"
+) %>%
+  as_tibble()
+
+dbDisconnect(con)
+
+stock_df
+
+```
+
+###stuff
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(zoo)
+
+download_yahoo_chart <- function(symbol, from, to, dest_folder = tempdir()) {
+  period1 <- as.integer(as.POSIXct(from, tz = "UTC"))
+  period2 <- as.integer(as.POSIXct(to,   tz = "UTC"))
+  
+  url <- paste0(
+    "https://query1.finance.yahoo.com/v8/finance/chart/",
+    symbol,
+    "?period1=", period1,
+    "&period2=", period2,
+    "&interval=1d&includePrePost=false&events=div%2Csplits"
+  )
+  
+  json_file <- file.path(dest_folder, paste0(symbol, "_chart.json"))
+  
+  status <- tryCatch(
+    system2(
+      "curl.exe",
+      args = c(
+        "-L",
+        "-A", "Mozilla/5.0",
+        "-o", shQuote(json_file),
+        url
+      )
+    ),
+    error = function(e) 1
+  )
+  
+  if (!file.exists(json_file) || status != 0) {
+    message("Failed download: ", symbol)
+    return(NULL)
+  }
+  
+  txt <- paste(readLines(json_file, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+  
+  obj <- tryCatch(fromJSON(txt, simplifyDataFrame = FALSE), error = function(e) NULL)
+  if (is.null(obj)) return(NULL)
+  
+  result <- obj$chart$result[[1]]
+  if (is.null(result)) return(NULL)
+  if (is.null(result$timestamp)) return(NULL)
+  
+  q <- result$indicators$quote[[1]]
+  if (is.null(q)) return(NULL)
+  
+  tibble(
+    symbol = symbol,
+    date   = as.Date(as.POSIXct(result$timestamp, origin = "1970-01-01", tz = "UTC")),
+    open   = as.numeric(q$open),
+    high   = as.numeric(q$high),
+    low    = as.numeric(q$low),
+    close  = as.numeric(q$close),
+    volume = as.numeric(q$volume)
+  ) %>%
+    filter(!is.na(date), !is.na(close))
+}
+
+flag_bad_history <- function(prices_tbl, min_nonzero_days = 20, min_total_days = 100) {
+  prices_tbl %>%
+    mutate(
+      flat_bar = !is.na(open) & !is.na(high) & !is.na(low) & !is.na(close) &
+        open == high & high == low & low == close,
+      zero_vol = is.na(volume) | volume == 0
+    ) %>%
+    group_by(symbol) %>%
+    summarise(
+      n_days = n(),
+      nonzero_vol_days = sum(!zero_vol, na.rm = TRUE),
+      flat_zero_days = sum(flat_bar & zero_vol, na.rm = TRUE),
+      all_flat_zero = all(flat_bar & zero_vol),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      bad_history = all_flat_zero |
+        nonzero_vol_days < min_nonzero_days |
+        n_days < min_total_days
+    )
+}
+
+run_open_to_close_strategy_curl <- function(stock_df,
+                                            stop_loss = 0.03,
+                                            lookback_days = 220,
+                                            min_nonzero_days = 20,
+                                            min_total_days = 100) {
+  tickers <- stock_df %>%
+    pull(Symbol) %>%
+    unique()
+  
+  signal_dates <- unique(as.Date(stock_df$date))
+  if (length(signal_dates) != 1) {
+    stop("stock_df debe tener una sola signal date por corrida.")
+  }
+  
+  signal_date <- signal_dates[1]
+  
+  from_date <- signal_date - lookback_days
+  to_date   <- signal_date + 10
+  
+  prices_list <- purrr::map(tickers, ~ download_yahoo_chart(.x, from = from_date, to = to_date))
+  names(prices_list) <- tickers
+  
+  failed <- names(prices_list)[purrr::map_lgl(prices_list, is.null)]
+  if (length(failed) > 0) {
+    message("Failed tickers: ", paste(failed, collapse = ", "))
+  }
+  
+  valid_prices <- prices_list[!purrr::map_lgl(prices_list, is.null)]
+  
+  if (length(valid_prices) == 0) {
+    stop("No se pudo descargar ningún ticker con curl.")
+  }
+  
+  prices <- bind_rows(valid_prices)
+  
+  quality_tbl <- flag_bad_history(
+    prices,
+    min_nonzero_days = min_nonzero_days,
+    min_total_days = min_total_days
+  )
+  
+  bad_symbols <- quality_tbl %>%
+    filter(bad_history) %>%
+    pull(symbol)
+  
+  if (length(bad_symbols) > 0) {
+    message("Excluded bad symbols: ", paste(bad_symbols, collapse = ", "))
+  }
+  
+  prices <- prices %>%
+    filter(!symbol %in% bad_symbols)
+  
+  if (nrow(prices) == 0) {
+    stop("Todos los tickers fueron excluidos por mala calidad de historia.")
+  }
+  
+  signals <- prices %>%
+    group_by(symbol) %>%
+    arrange(.data$date, .by_group = TRUE) %>%
+    mutate(
+      ma10  = zoo::rollmean(close, 10, fill = NA, align = "right"),
+      ma20  = zoo::rollmean(close, 20, fill = NA, align = "right"),
+      ma100 = zoo::rollmean(close, 100, fill = NA, align = "right")
+    ) %>%
+    ungroup()
+  
+  signal_tbl <- signals %>%
+    filter(.data$date == signal_date) %>%
+   mutate(
+  pass_filter = !is.na(ma10) & !is.na(ma20) & !is.na(ma100) &
+    close > ma10 &
+    ma10 > ma20 &
+    close > ma100) %>%
+    select(symbol, signal_date = date, ma10, ma20, ma100, pass_filter)
+  
+  entry_tbl <- signals %>%
+    filter(.data$date > signal_date) %>%
+    group_by(symbol) %>%
+    slice_min(order_by = .data$date, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    select(symbol, entry_date = date, open, high, low, close)
+  
+  trades <- signal_tbl %>%
+    filter(pass_filter) %>%
+    inner_join(entry_tbl, by = "symbol") %>%
+    mutate(
+      entry_price = open,
+      stop_price  = entry_price * (1 - stop_loss),
+      stop_hit    = low <= stop_price,
+      exit_price  = if_else(stop_hit, stop_price, close),
+      exit_reason = if_else(stop_hit, "stop_loss", "close_exit"),
+      hold_days   = 1L,
+      return_pct  = (exit_price / entry_price - 1) * 100
+    )
+  
+  stock_df %>%
+    rename(symbol = Symbol, name = Name) %>%
+    select(
+      -any_of(c(
+        "ma10", "ma20", "ma100", "close_px",
+        "close_above_ma10", "close_above_ma20",
+        "ma10_above_ma20", "ma_setup_ok"
+      ))
+    ) %>%
+    inner_join(trades, by = "symbol") %>%
+    select(
+      symbol, name,
+      signal_date, entry_date,
+      ma10, ma20, ma100,
+      open, high, low, close,
+      entry_price, stop_price, stop_hit,
+      exit_price, exit_reason, hold_days, return_pct
+    ) %>%
+    arrange(desc(return_pct))
+}
+
+```
+
+```{r}
+safe_run_strategy <- function(df) {
+  tryCatch(
+    run_open_to_close_strategy_curl(df, stop_loss = 0.03),
+    error = function(e) {
+      message("Failed date: ", unique(df$date), " -> ", e$message)
+      tibble()
+    }
+  )
+}
+
+all_results <- stock_df %>%
+  mutate(date = as.Date(date)) %>%
+ # filter(date < max(date, na.rm = TRUE)) %>%   # remove latest signal date
+  group_split(date) %>%
+  purrr::map_dfr(safe_run_strategy)
+  
+```
+
+```{r}
+write.csv(all_results,"all_results.csv")
+```
+
+
+
+```{r}
+all_results %>% count(entry_date)
+```
+
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(tibble)
+
+# optional: inspect before upload
+glimpse(all_results)
+print(nrow(all_results))
+
+if (nrow(all_results) == 0) {
+  stop("all_results has 0 rows, so there is nothing to upload.")
+}
+
+# make sure column types match your Supabase table
+results_to_upload <- all_results %>%
+  mutate(
+    symbol      = as.character(symbol),
+    name        = as.character(name),
+    signal_date = as.Date(signal_date),
+    entry_date  = as.Date(entry_date),
+    ma10        = as.numeric(ma10),
+    ma20        = as.numeric(ma20),
+    ma100       = as.numeric(ma100),
+    open        = as.numeric(open),
+    high        = as.numeric(high),
+    low         = as.numeric(low),
+    close       = as.numeric(close),
+    entry_price = as.numeric(entry_price),
+    stop_price  = as.numeric(stop_price),
+    stop_hit    = as.logical(stop_hit),
+    exit_price  = as.numeric(exit_price),
+    exit_reason = as.character(exit_reason),
+    hold_days   = as.integer(hold_days),
+    return_pct  = as.numeric(return_pct)
+  ) %>%
+  distinct(symbol, signal_date, .keep_all = TRUE)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+# write to temporary staging table
+dbWriteTable(
+  con,
+  Id(schema = "public", table = "tmp_yahoo_52wk_trades"),
+  results_to_upload,
+  overwrite = TRUE,
+  temporary = FALSE
+)
+
+# upsert into final table
+dbExecute(con, "
+INSERT INTO public.yahoo_52wk_trades (
+  symbol, name, signal_date, entry_date,
+  ma10, ma20, ma100,
+  open, high, low, close,
+  entry_price, stop_price, stop_hit,
+  exit_price, exit_reason, hold_days, return_pct
+)
+SELECT
+  symbol, name, signal_date, entry_date,
+  ma10, ma20, ma100,
+  open, high, low, close,
+  entry_price, stop_price, stop_hit,
+  exit_price, exit_reason, hold_days, return_pct
+FROM public.tmp_yahoo_52wk_trades
+ON CONFLICT (symbol, signal_date)
+DO UPDATE SET
+  name        = EXCLUDED.name,
+  entry_date  = EXCLUDED.entry_date,
+  ma10        = EXCLUDED.ma10,
+  ma20        = EXCLUDED.ma20,
+  ma100       = EXCLUDED.ma100,
+  open        = EXCLUDED.open,
+  high        = EXCLUDED.high,
+  low         = EXCLUDED.low,
+  close       = EXCLUDED.close,
+  entry_price = EXCLUDED.entry_price,
+  stop_price  = EXCLUDED.stop_price,
+  stop_hit    = EXCLUDED.stop_hit,
+  exit_price  = EXCLUDED.exit_price,
+  exit_reason = EXCLUDED.exit_reason,
+  hold_days   = EXCLUDED.hold_days,
+  return_pct  = EXCLUDED.return_pct;
+")
+
+# optional cleanup
+dbExecute(con, "DROP TABLE IF EXISTS public.tmp_yahoo_52wk_trades")
+
+# verify insert
+check_n <- dbGetQuery(con, "SELECT COUNT(*) AS n FROM public.yahoo_52wk_trades")
+print(check_n)
+
+dbDisconnect(con)
+```
+
+```{r}
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require")
+
+data3 <- DBI::dbReadTable(con, "yahoo_52wk_trades") %>%
+  tibble::as_tibble()
+
+
+```
+
+```{r}
+data3 %>% filter(entry_date=="2026-04-16") %>% arrange(desc(return_pct))
+```
+
+```{r}
+
+overall_stats <- data3 %>%
+  summarise(
+    n_trades = n(),
+    wins = sum(return_pct > 0, na.rm = TRUE),
+    losses = sum(return_pct <= 0, na.rm = TRUE),
+    win_rate = mean(return_pct > 0, na.rm = TRUE),
+    avg_return = mean(return_pct, na.rm = TRUE),
+    median_return = median(return_pct, na.rm = TRUE),
+    total_return = sum(return_pct, na.rm = TRUE)
+  )
+
+overall_stats
+```
+
+```{r}
+overall_stats %>%
+  mutate(win_rate = win_rate * 100)
+```
+
+
+
+
+```{r}
+win_rate_by_entry_day <- data3 %>%
+  group_by(entry_date) %>%
+  summarise(
+    n_trades = n(),
+    wins = sum(return_pct > 0, na.rm = TRUE),
+    losses = sum(return_pct <= 0, na.rm = TRUE),
+    win_rate = mean(return_pct > 0, na.rm = TRUE) * 100,
+    avg_return = mean(return_pct, na.rm = TRUE),
+    median_return = median(return_pct, na.rm = TRUE),
+    total_return = sum(return_pct, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(entry_date)
+
+win_rate_by_entry_day
+```
+
+
+```{r}
+library(dplyr)
+
+position_size <- 100
+
+trades_dollars <- all_results %>%
+  mutate(
+    pnl_dollars = position_size * (return_pct / 100),
+    end_value = position_size + pnl_dollars
+  )
+
+# money made per actual trading day
+daily_pnl <- trades_dollars %>%
+  group_by(entry_date) %>%
+  summarise(
+    n_trades = n(),
+    capital_deployed = n_trades * position_size,
+    daily_pnl = sum(pnl_dollars, na.rm = TRUE),
+    end_of_day_value = capital_deployed + daily_pnl,
+    avg_pnl_per_trade = mean(pnl_dollars, na.rm = TRUE),
+    win_rate = mean(return_pct > 0, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(entry_date)
+
+daily_pnl
+```
+
+
+```{r}
+overall_pnl <- trades_dollars %>%
+  summarise(
+    total_trades = n(),
+    total_capital_deployed = total_trades * position_size,
+    total_pnl = sum(pnl_dollars, na.rm = TRUE),
+    total_end_value = total_capital_deployed + total_pnl,
+    avg_pnl_per_trade = mean(pnl_dollars, na.rm = TRUE),
+    win_rate = mean(return_pct > 0, na.rm = TRUE) * 100
+  )
+
+overall_pnl
+```
+
+```{r}
+daily_pnl_running <- trades_dollars %>%
+  group_by(entry_date) %>%
+  summarise(
+    daily_pnl = sum(position_size * (return_pct / 100), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(entry_date) %>%
+  mutate(cum_pnl = cumsum(daily_pnl))
+
+daily_pnl_running
+```
+
+```{r}
+position_size <- 100
+
+daily_summary <- data3 %>%
+  mutate(pnl_dollars = position_size * return_pct / 100) %>%
+  group_by(entry_date) %>%
+  summarise(
+    trades = n(),
+    invested_that_day = trades * position_size,
+    pnl_that_day = sum(pnl_dollars, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(entry_date) %>%
+  mutate(
+    cumulative_pnl = cumsum(pnl_that_day)
+  )
+
+daily_summary
+```
+
+
+```{r}
+sum(data3$return_pct / 100 * 100, na.rm = TRUE)
+```
+
+
+
+```{r}
+sum(data3$return_pct, na.rm = TRUE)
+```
+
+##########CURVE
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+initial_capital <- 10000
+position_size <- 100
+
+daily_equity <- data3 %>%
+  mutate(
+    pnl_dollars = position_size * (return_pct / 100)
+  ) %>%
+  group_by(entry_date) %>%
+  summarise(
+    trades = n(),
+    capital_deployed = trades * position_size,
+    daily_pnl = sum(pnl_dollars, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(entry_date) %>%
+  mutate(
+    cumulative_pnl = cumsum(daily_pnl),
+    equity = initial_capital + cumulative_pnl,
+    peak_equity = cummax(equity),
+    drawdown_dollars = equity - peak_equity,
+    drawdown_pct = 100 * (equity / peak_equity - 1)
+  )
+
+daily_equity
+```
+
+```{r}
+overall_summary <- daily_equity %>%
+  summarise(
+    start_capital = initial_capital,
+    end_capital = last(equity),
+    total_profit = last(cumulative_pnl),
+    total_return_pct = 100 * (last(equity) / initial_capital - 1),
+    best_day = max(daily_pnl, na.rm = TRUE),
+    worst_day = min(daily_pnl, na.rm = TRUE),
+    max_drawdown_pct = min(drawdown_pct, na.rm = TRUE)
+  )
+
+overall_summary
+```
+
+```{r}
+ggplot(daily_equity, aes(x = entry_date, y = equity)) +
+  geom_line() +
+  labs(
+    title = "Equity Curve: $10,000 Start, $100 Per Trade",
+    x = "Entry Date",
+    y = "Equity ($)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+daily_equity %>%
+  select(
+    entry_date,
+    trades,
+    capital_deployed,
+    daily_pnl,
+    cumulative_pnl,
+    equity,
+    drawdown_pct
+  )
+```
+
+
+
+
+
+
+
+
+```{r}
+stock_df_for_strategy <- stock_df %>%
+  rename(
+    Symbol = Symbol,
+    Name = Name,
+    date = date
+  )
+```
+
+
+```{r}
+
+library(DBI)
+library(RPostgres)
+library(dplyr)
+
+trade_upload <- results %>%
+  transmute(
+    symbol      = as.character(symbol),
+    name        = as.character(name),
+    signal_date = as.Date(signal_date),
+    entry_date  = as.Date(entry_date),
+    ma10        = as.numeric(ma10),
+    ma20        = as.numeric(ma20),
+    ma100       = as.numeric(ma100),
+    open        = as.numeric(open),
+    high        = as.numeric(high),
+    low         = as.numeric(low),
+    close       = as.numeric(close),
+    entry_price = as.numeric(entry_price),
+    stop_price  = as.numeric(stop_price),
+    stop_hit    = as.logical(stop_hit),
+    exit_price  = as.numeric(exit_price),
+    exit_reason = as.character(exit_reason),
+    hold_days   = as.integer(hold_days),
+    return_pct  = as.numeric(return_pct)
+  ) %>%
+  distinct(symbol, signal_date, .keep_all = TRUE)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host     = "aws-0-us-east-2.pooler.supabase.com",
+  port     = 5432,
+  dbname   = "postgres",
+  user     = "postgres.zdizrqyeuyqdlmvgadkm",
+  password = "DMPS1934*",
+  sslmode  = "require"
+)
+
+dbWriteTable(
+  con,
+  "tmp_yahoo_52wk_trades",
+  trade_upload,
+  temporary = TRUE,
+  overwrite = TRUE
+)
+
+dbExecute(con, '
+  INSERT INTO public.yahoo_52wk_trades AS t
+    (symbol, name, signal_date, entry_date, ma10, ma20, ma100,
+     open, high, low, close, entry_price, stop_price, stop_hit,
+     exit_price, exit_reason, hold_days, return_pct)
+  SELECT
+    symbol, name, signal_date, entry_date, ma10, ma20, ma100,
+    open, high, low, close, entry_price, stop_price, stop_hit,
+    exit_price, exit_reason, hold_days, return_pct
+  FROM tmp_yahoo_52wk_trades
+  ON CONFLICT (symbol, signal_date) DO UPDATE
+  SET
+    name        = EXCLUDED.name,
+    entry_date  = EXCLUDED.entry_date,
+    ma10        = EXCLUDED.ma10,
+    ma20        = EXCLUDED.ma20,
+    ma100       = EXCLUDED.ma100,
+    open        = EXCLUDED.open,
+    high        = EXCLUDED.high,
+    low         = EXCLUDED.low,
+    close       = EXCLUDED.close,
+    entry_price = EXCLUDED.entry_price,
+    stop_price  = EXCLUDED.stop_price,
+    stop_hit    = EXCLUDED.stop_hit,
+    exit_price  = EXCLUDED.exit_price,
+    exit_reason = EXCLUDED.exit_reason,
+    hold_days   = EXCLUDED.hold_days,
+    return_pct  = EXCLUDED.return_pct;
+')
+
+dbDisconnect(con)
+
+
+```
+
+
+
