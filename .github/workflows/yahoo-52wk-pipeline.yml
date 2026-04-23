@@ -42,6 +42,7 @@ jobs:
           install.packages(
             c(
               "DBI",
+              "tidyr",
               "RPostgres",
               "dplyr",
               "purrr",
