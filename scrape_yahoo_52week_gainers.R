@@ -124,23 +124,24 @@ scrape_yahoo_page <- function(start_value,
 
 clean_yahoo_table <- function(all_data) {
   run_date <- today(tzone = "America/New_York")
-  
+
   all_data %>%
     mutate(
-      Price_raw = Price,
-      Price = str_extract(Price_raw, "^[0-9,.]+"),
-      Price = parse_number(Price),
-      `Change` = parse_number(`Change`),
-      `Change %` = parse_number(`Change %`),
-      Volume = parse_yahoo_num(Volume),
-      `Avg Vol (3M)` = parse_yahoo_num(`Avg Vol (3M)`),
-      `Market Cap` = parse_yahoo_num(`Market Cap`),
-      `52 Wk Change %` = parse_number(`52 Wk Change %`),
-      `P/E Ratio (TTM)` = na_if(`P/E Ratio (TTM)`, "--"),
-      `P/E Ratio (TTM)` = parse_number(`P/E Ratio (TTM)`),
-      `52 Wk Range` = str_squish(`52 Wk Range`)
+      across(everything(), ~ if (is.factor(.x)) as.character(.x) else .x),
+      Price_raw = as.character(Price),
+      Price = str_extract(as.character(Price_raw), "^[0-9,.]+"),
+      Price = parse_number(as.character(Price)),
+      Change = parse_number(as.character(Change)),
+      `Change %` = parse_number(as.character(`Change %`)),
+      Volume = parse_yahoo_num(as.character(Volume)),
+      `Avg Vol (3M)` = parse_yahoo_num(as.character(`Avg Vol (3M)`)),
+      `Market Cap` = parse_yahoo_num(as.character(`Market Cap`)),
+      `52 Wk Change %` = parse_number(as.character(`52 Wk Change %`)),
+      `P/E Ratio (TTM)` = na_if(as.character(`P/E Ratio (TTM)`), "--"),
+      `P/E Ratio (TTM)` = parse_number(as.character(`P/E Ratio (TTM)`)),
+      `52 Wk Range` = str_squish(as.character(`52 Wk Range`))
     ) %>%
-    separate(
+    tidyr::separate(
       `52 Wk Range`,
       into = c("wk52_low", "wk52_high"),
       sep = "\\s+",
