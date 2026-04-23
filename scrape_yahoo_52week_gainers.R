@@ -78,37 +78,43 @@ scrape_yahoo_page <- function(start_value,
                               dest_folder = tempdir(),
                               base_url = "https://finance.yahoo.com/markets/stocks/52-week-gainers/") {
   url <- paste0(base_url, "?start=", start_value, "&count=", page_size)
-  
+
   html_file <- file.path(
     dest_folder,
     paste0("yahoo_52_week_gainers_", start_value, ".html")
   )
-  
+
   ok <- download_page_html(url, html_file)
   if (!ok) {
     message("Download failed for start=", start_value)
     return(NULL)
   }
-  
+
   page <- tryCatch(read_html(html_file), error = function(e) NULL)
   if (is.null(page)) {
     message("Could not parse HTML for start=", start_value)
     return(NULL)
   }
-  
+
   tables <- page %>%
     html_elements("table") %>%
     html_table(fill = TRUE)
-  
+
   if (length(tables) == 0) {
     message("No tables found for start=", start_value)
     return(NULL)
   }
-  
-  out <- as_tibble(tables[[1]])
-  
-  names(out)[names(out) == ""] <- "Chart"
-  
+
+  out <- as_tibble(tables[[1]], .name_repair = "minimal")
+
+  nm <- names(out)
+  blank_idx <- which(is.na(nm) | nm == "")
+
+  if (length(blank_idx) > 0) {
+    nm[blank_idx] <- paste0("Chart", seq_along(blank_idx))
+    names(out) <- nm
+  }
+
   out %>%
     mutate(
       start = start_value,
