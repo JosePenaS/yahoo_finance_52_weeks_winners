@@ -1,5 +1,4 @@
 #!/usr/bin/env Rscript
-
 suppressPackageStartupMessages({
   library(DBI)
   library(RPostgres)
@@ -11,6 +10,7 @@ suppressPackageStartupMessages({
   library(stringr)
   library(tibble)
   library(lubridate)
+  library(tidyr)
 })
 
 message("Starting scrape_yahoo_52week_gainers.R")
