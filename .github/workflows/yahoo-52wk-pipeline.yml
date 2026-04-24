@@ -62,4 +62,4 @@ jobs:
         run: Rscript scrape_yahoo_52week_gainers.R
 
       - name: Run strategy
-        run: Rscript update_yahoo_52wk_trades.Rmd
+        run: Rscript update_yahoo_52wk_trades.R
